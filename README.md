@@ -11,6 +11,20 @@
 
 </p>
 
+## Metacognitive Conformal Prediction
+
+This project forks the open source [conformal prediction](https://github.com/aangelopoulos/conformal_classification) project and updates for its use in Metacognitive AI Platform. 
+
+### Build
+
+A makefile is created along with the requirements.txt for easy installation. We use python venv for the build.
+
+```
+make
+```
+
+The rest of the Readme is from the original project.
+
 ## Paper 
 [Uncertainty Sets for Image Classifiers using Conformal Prediction](https://arxiv.org/abs/2009.14193)
 ```
