@@ -75,7 +75,7 @@ def validate(val_loader, model, print_bool):
     if print_bool:
         print('') #Endline
 
-    return top1.avg, top5.avg, coverage.avg, size.avg 
+    return top1.avg, top5.avg, coverage.avg, size.avg
 
 def coverage_size(S,targets):
     covered = 0
@@ -154,20 +154,35 @@ def get_model(modelname):
     return model
 
 # Computes logits and targets from a model and loader
-def get_logits_targets(model, loader):
-    logits = torch.zeros((len(loader.dataset), 1000)) # 1000 classes in Imagenet.
-    labels = torch.zeros((len(loader.dataset),))
+def get_logits_targets(model):
+    logits = torch.zeros((len(model.csv_datasets['train']), len(model.labels)))
+    labels = torch.zeros((len(model.csv_datasets['train'])))
     i = 0
     print(f'Computing logits for model (only happens once).')
-    with torch.no_grad():
-        for x, targets in tqdm(loader):
-            batch_logits = model(x.cuda()).detach().cpu()
-            logits[i:(i+x.shape[0]), :] = batch_logits
-            labels[i:(i+x.shape[0])] = targets.cpu()
-            i = i + x.shape[0]
-    
+
+    lbls = model.csv_datasets['train']['label'].values
+    txts = model.csv_datasets['train']['text'].values
+
+    for i in range(len(labels)):
+        txt = txts[i]
+        lbl = lbls[i]
+
+        out = model.predict(txt)
+        lgts = model.get_logits()
+
+        logits[i, :] = torch.from_numpy(np.array(lgts))
+        labels[i] = torch.from_numpy(np.array(lbl))
+
+    """
+    for x, targets in tqdm(loader):
+        batch_logits = model(x.cuda()).detach().cpu()
+        logits[i:(i+x.shape[0]), :] = batch_logits
+        labels[i:(i+x.shape[0])] = targets.cpu()
+        i = i + x.shape[0]
+    """
+
     # Construct the dataset
-    dataset_logits = torch.utils.data.TensorDataset(logits, labels.long()) 
+    dataset_logits = torch.utils.data.TensorDataset(logits, labels.long())
     return dataset_logits
 
 def get_logits_dataset(modelname, datasetname, datasetpath, cache=str(pathlib.Path(__file__).parent.absolute()) + '/experiments/.cache/'):
