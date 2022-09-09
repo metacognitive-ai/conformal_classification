@@ -154,24 +154,22 @@ def get_model(modelname):
     return model
 
 # Computes logits and targets from a model and loader
-def get_logits_targets(model):
-    logits = torch.zeros((len(model.csv_datasets['train']), len(model.labels)))
-    labels = torch.zeros((len(model.csv_datasets['train'])))
+def get_logits_targets(helper):
+    logits = torch.zeros((len(helper.datasets['train']['data']), helper.num_classes))
+    labels = torch.zeros((len(helper.datasets['train']['data'])))
     i = 0
     print(f'Computing logits for model (only happens once).')
 
-    lbls = model.csv_datasets['train']['label'].values
-    txts = model.csv_datasets['train']['text'].values
-
-    for i in range(len(labels)):
-        txt = txts[i]
-        lbl = lbls[i]
-
-        out = model.predict(txt)
-        lgts = model.get_logits()
-
-        logits[i, :] = torch.from_numpy(np.array(lgts))
-        labels[i] = torch.from_numpy(np.array(lbl))
+    # NOTE: We need to add .values at the end of two lines below for fasttext use (dataframes)
+    lbls = helper.datasets['train']['label'].values
+    data = helper.datasets['train']['data'].values
+    # Iterate according to the batch size
+    i = 0
+    while i + helper.batch_size <= len(lbls):
+        lgts = helper.get_logits(data[i:(i+helper.batch_size)])
+        logits[i:(i+helper.batch_size), :] = torch.from_numpy(np.array(lgts))
+        labels[i:(i+helper.batch_size)] = torch.from_numpy(np.array(lbls[i:(i+helper.batch_size)]))
+        i = i + helper.batch_size
 
     """
     for x, targets in tqdm(loader):

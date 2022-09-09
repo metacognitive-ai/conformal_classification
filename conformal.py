@@ -15,23 +15,25 @@ import pdb
 # Save it to a file in .cache/modelname
 # The only difference is that the forward method of ConformalModel also outputs a set.
 class ConformalModel(nn.Module):
-    def __init__(self, model, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, pct_paramtune = 0.3, batch_size=32, lamda_criterion='size'):
+    def __init__(self, model_helper, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, pct_paramtune = 0.3, lamda_criterion='size'):
         super(ConformalModel, self).__init__()
-        self.model = model
+        self.model_helper = model_helper
+        self.model = model_helper.model
         self.alpha = alpha
         self.T = torch.Tensor([1.3]) #initialize (1.3 is usually a good value)
-        self.T, calib_logits = platt(model)
+        # TODO: It is more structured to give self to platt method
+        self.T, calib_logits = platt(self.model_helper)
         self.randomized=randomized
         self.allow_zero_sets=allow_zero_sets
-        self.num_classes = len(model.labels)
-
+        self.num_classes = model_helper.num_classes
+        self.batch_size = model_helper.batch_size
         if kreg == None or lamda == None:
-            kreg, lamda, calib_logits = pick_parameters(model, calib_logits, alpha, kreg, lamda, randomized, allow_zero_sets, pct_paramtune, batch_size, lamda_criterion)
+            kreg, lamda, calib_logits = pick_parameters(self.model, calib_logits, alpha, kreg, lamda, randomized, allow_zero_sets, pct_paramtune, self.batch_size, lamda_criterion)
 
         self.penalties = np.zeros((1, self.num_classes))
         self.penalties[:, kreg:] += lamda
 
-        calib_loader = tdata.DataLoader(calib_logits, batch_size = batch_size, shuffle=False, pin_memory=True)
+        calib_loader = tdata.DataLoader(calib_logits, batch_size=self.batch_size, shuffle=False, pin_memory=True)
 
         self.Qhat = conformal_calibration_logits(self, calib_loader)
 
@@ -40,7 +42,7 @@ class ConformalModel(nn.Module):
             randomized = self.randomized
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
-        logits = self.model(*args, **kwargs)
+        logits = self.model.get_logits(*args, **kwargs)
 
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
@@ -70,13 +72,13 @@ def conformal_calibration(cmodel, calib_loader):
         return Qhat
 
 # Temperature scaling
-def platt(cmodel, max_iters=10, lr=0.01, epsilon=0.01):
+def platt(helper, max_iters=10, lr=0.01, epsilon=0.01):
     print("Begin Platt scaling.")
     # Save logits so don't need to double compute them
-    logits_dataset = get_logits_targets(cmodel)
-    logits_loader = torch.utils.data.DataLoader(logits_dataset, batch_size=cmodel.batch_size, shuffle=False, pin_memory=True)
+    logits_dataset = get_logits_targets(helper)
+    logits_loader = torch.utils.data.DataLoader(logits_dataset, batch_size=helper.batch_size, shuffle=False, pin_memory=True)
 
-    T = platt_logits(cmodel, logits_loader, max_iters=max_iters, lr=lr, epsilon=epsilon)
+    T = platt_logits(helper, logits_loader, max_iters=max_iters, lr=lr, epsilon=epsilon)
 
     print(f"Optimal T={T.item()}")
     return T, logits_dataset
