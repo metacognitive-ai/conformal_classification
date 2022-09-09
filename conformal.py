@@ -10,25 +10,26 @@ from tqdm import tqdm
 from utils import validate, get_logits_targets, sort_sum
 import pdb
 
+
 # Conformalize a model with a calibration set.
 # Save it to a file in .cache/modelname
 # The only difference is that the forward method of ConformalModel also outputs a set.
 class ConformalModel(nn.Module):
-    def __init__(self, model, calib_loader, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, pct_paramtune = 0.3, batch_size=32, lamda_criterion='size'):
+    def __init__(self, model, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, pct_paramtune = 0.3, batch_size=32, lamda_criterion='size'):
         super(ConformalModel, self).__init__()
-        self.model = model 
+        self.model = model
         self.alpha = alpha
         self.T = torch.Tensor([1.3]) #initialize (1.3 is usually a good value)
-        self.T, calib_logits = platt(self, calib_loader)
+        self.T, calib_logits = platt(model)
         self.randomized=randomized
         self.allow_zero_sets=allow_zero_sets
-        self.num_classes = len(calib_loader.dataset.dataset.classes)
+        self.num_classes = len(model.labels)
 
         if kreg == None or lamda == None:
             kreg, lamda, calib_logits = pick_parameters(model, calib_logits, alpha, kreg, lamda, randomized, allow_zero_sets, pct_paramtune, batch_size, lamda_criterion)
 
         self.penalties = np.zeros((1, self.num_classes))
-        self.penalties[:, kreg:] += lamda 
+        self.penalties[:, kreg:] += lamda
 
         calib_loader = tdata.DataLoader(calib_logits, batch_size = batch_size, shuffle=False, pin_memory=True)
 
@@ -40,7 +41,7 @@ class ConformalModel(nn.Module):
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
         logits = self.model(*args, **kwargs)
-        
+
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
             scores = softmax(logits_numpy/self.T.item(), axis=1)
@@ -63,22 +64,22 @@ def conformal_calibration(cmodel, calib_loader):
             I, ordered, cumsum = sort_sum(scores)
 
             E = np.concatenate((E,giq(scores,targets,I=I,ordered=ordered,cumsum=cumsum,penalties=cmodel.penalties,randomized=True, allow_zero_sets=True)))
-            
+
         Qhat = np.quantile(E,1-cmodel.alpha,interpolation='higher')
 
-        return Qhat 
+        return Qhat
 
 # Temperature scaling
-def platt(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
+def platt(cmodel, max_iters=10, lr=0.01, epsilon=0.01):
     print("Begin Platt scaling.")
     # Save logits so don't need to double compute them
-    logits_dataset = get_logits_targets(cmodel.model, calib_loader)
-    logits_loader = torch.utils.data.DataLoader(logits_dataset, batch_size = calib_loader.batch_size, shuffle=False, pin_memory=True)
+    logits_dataset = get_logits_targets(cmodel)
+    logits_loader = torch.utils.data.DataLoader(logits_dataset, batch_size=cmodel.batch_size, shuffle=False, pin_memory=True)
 
     T = platt_logits(cmodel, logits_loader, max_iters=max_iters, lr=lr, epsilon=epsilon)
 
     print(f"Optimal T={T.item()}")
-    return T, logits_dataset 
+    return T, logits_dataset
 
 """
 
@@ -93,7 +94,7 @@ def platt(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
 class ConformalModelLogits(nn.Module):
     def __init__(self, model, calib_loader, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, naive=False, LAC=False, pct_paramtune = 0.3, batch_size=32, lamda_criterion='size'):
         super(ConformalModelLogits, self).__init__()
-        self.model = model 
+        self.model = model
         self.alpha = alpha
         self.randomized = randomized
         self.LAC = LAC
@@ -112,7 +113,7 @@ class ConformalModelLogits(nn.Module):
             self.Qhat = conformal_calibration_logits(self, calib_loader)
         elif not naive and LAC:
             gt_locs_cal = np.array([np.where(np.argsort(x[0]).flip(dims=(0,)) == x[1])[0][0] for x in calib_loader.dataset])
-            scores_cal = 1-np.array([np.sort(torch.softmax(calib_loader.dataset[i][0]/self.T.item(), dim=0))[::-1][gt_locs_cal[i]] for i in range(len(calib_loader.dataset))]) 
+            scores_cal = 1-np.array([np.sort(torch.softmax(calib_loader.dataset[i][0]/self.T.item(), dim=0))[::-1][gt_locs_cal[i]] for i in range(len(calib_loader.dataset))])
             self.Qhat = np.quantile( scores_cal , np.ceil((scores_cal.shape[0]+1) * (1-alpha)) / scores_cal.shape[0] )
 
     def forward(self, logits, randomized=None, allow_zero_sets=None):
@@ -120,7 +121,7 @@ class ConformalModelLogits(nn.Module):
             randomized = self.randomized
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
-        
+
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
             scores = softmax(logits_numpy/self.T.item(), axis=1)
@@ -145,30 +146,30 @@ def conformal_calibration_logits(cmodel, calib_loader):
             I, ordered, cumsum = sort_sum(scores)
 
             E = np.concatenate((E,giq(scores,targets,I=I,ordered=ordered,cumsum=cumsum,penalties=cmodel.penalties,randomized=True,allow_zero_sets=True)))
-            
+
         Qhat = np.quantile(E,1-cmodel.alpha,interpolation='higher')
 
-        return Qhat 
+        return Qhat
 
 def platt_logits(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
     nll_criterion = nn.CrossEntropyLoss().cuda()
 
-    T = nn.Parameter(torch.Tensor([1.3]).cuda())
+    T = nn.Parameter(torch.Tensor([1.3]).cpu())
 
     optimizer = optim.SGD([T], lr=lr)
     for iter in range(max_iters):
         T_old = T.item()
         for x, targets in calib_loader:
             optimizer.zero_grad()
-            x = x.cuda()
+            x = x.cpu()
             x.requires_grad = True
             out = x/T
-            loss = nll_criterion(out, targets.long().cuda())
+            loss = nll_criterion(out, targets.long().cpu())
             loss.backward()
             optimizer.step()
         if abs(T_old - T.item()) < epsilon:
             break
-    return T 
+    return T
 
 ### CORE CONFORMAL INFERENCE FUNCTIONS
 
@@ -209,18 +210,18 @@ def get_tau(score, target, I, ordered, cumsum, penalty, randomized, allow_zero_s
 
     if not randomized:
         return tau_nonrandom + penalty[0]
-    
+
     U = np.random.random()
 
     if idx == (0,0):
         if not allow_zero_sets:
             return tau_nonrandom + penalty[0]
         else:
-            return U * tau_nonrandom + penalty[0] 
+            return U * tau_nonrandom + penalty[0]
     else:
         return U * ordered[idx] + cumsum[(idx[0],idx[1]-1)] + (penalty[0:(idx[1][0]+1)]).sum()
 
-# Gets the histogram of Taus. 
+# Gets the histogram of Taus.
 def giq(scores, targets, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
     """
         Generalized inverse quantile conformity score function.
@@ -236,11 +237,11 @@ def giq(scores, targets, I, ordered, cumsum, penalties, randomized, allow_zero_s
 def pick_kreg(paramtune_logits, alpha):
     gt_locs_kstar = np.array([np.where(np.argsort(x[0]).flip(dims=(0,)) == x[1])[0][0] for x in paramtune_logits])
     kstar = np.quantile(gt_locs_kstar, 1-alpha, interpolation='higher') + 1
-    return kstar 
+    return kstar
 
 def pick_lamda_size(model, paramtune_loader, alpha, kreg, randomized, allow_zero_sets):
     # Calculate lamda_star
-    best_size = iter(paramtune_loader).__next__()[0][1].shape[0] # number of classes 
+    best_size = iter(paramtune_loader).__next__()[0][1].shape[0] # number of classes
     # Use the paramtune data to pick lamda.  Does not violate exchangeability.
     for temp_lam in [0.001, 0.01, 0.1, 0.2, 0.5]: # predefined grid, change if more precision desired.
         conformal_model = ConformalModelLogits(model, paramtune_loader, alpha=alpha, kreg=kreg, lamda=temp_lam, randomized=randomized, allow_zero_sets=allow_zero_sets, naive=False)
@@ -259,7 +260,7 @@ def pick_lamda_adaptiveness(model, paramtune_loader, alpha, kreg, randomized, al
         conformal_model = ConformalModelLogits(model, paramtune_loader, alpha=alpha, kreg=kreg, lamda=temp_lam, randomized=randomized, allow_zero_sets=allow_zero_sets, naive=False)
         curr_violation = get_violation(conformal_model, paramtune_loader, strata, alpha)
         if curr_violation < best_violation:
-            best_violation = curr_violation 
+            best_violation = curr_violation
             lamda_star = temp_lam
     return lamda_star
 
@@ -285,7 +286,7 @@ def get_violation(cmodel, loader_paramtune, strata, alpha):
         output, S = cmodel(logit) # This is a 'dummy model' which takes logits, for efficiency.
         # measure accuracy and record loss
         size = np.array([x.size for x in S])
-        I, _, _ = sort_sum(logit.numpy()) 
+        I, _, _ = sort_sum(logit.numpy())
         correct = np.zeros_like(size)
         for j in range(correct.shape[0]):
             correct[j] = int( target[j] in list(S[j]) )
@@ -299,4 +300,3 @@ def get_violation(cmodel, loader_paramtune, strata, alpha):
         stratum_violation = abs(temp_df.correct.mean()-(1-alpha))
         wc_violation = max(wc_violation, stratum_violation)
     return wc_violation # the violation
-
