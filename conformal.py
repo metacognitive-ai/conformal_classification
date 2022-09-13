@@ -7,7 +7,7 @@ import torch.utils.data as tdata
 import pandas as pd
 import time
 from tqdm import tqdm
-from utils import validate, get_logits_targets, sort_sum
+from utils import validate, get_logits_targets, sort_sum, sort_sum_dataloader
 import pdb
 
 
@@ -36,18 +36,19 @@ class ConformalModel(nn.Module):
         calib_loader = tdata.DataLoader(calib_logits, batch_size=self.batch_size, shuffle=False, pin_memory=True)
 
         self.Qhat = conformal_calibration_logits(self, calib_loader)
+        print(f"Qhat value: {self.Qhat}")
 
     def forward(self, *args, randomized=None, allow_zero_sets=None, **kwargs):
         if randomized == None:
             randomized = self.randomized
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
-        logits = self.model.get_logits(*args, **kwargs)
-
+        logits = self.model_helper.get_logits(*args, **kwargs)
+        logits = torch.from_numpy(np.array(logits))
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
-            scores = softmax(logits_numpy/self.T.item(), axis=1)
-
+            #TODO: is this axis=1 relates to image or logits? We should make parametric
+            scores = softmax(logits_numpy/self.T.item())#, axis=1)
             I, ordered, cumsum = sort_sum(scores)
 
             S = gcq(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
@@ -145,7 +146,7 @@ def conformal_calibration_logits(cmodel, calib_loader):
 
             scores = softmax(logits/cmodel.T.item(), axis=1)
 
-            I, ordered, cumsum = sort_sum(scores)
+            I, ordered, cumsum = sort_sum_dataloader(scores)
 
             E = np.concatenate((E,giq(scores,targets,I=I,ordered=ordered,cumsum=cumsum,penalties=cmodel.penalties,randomized=True,allow_zero_sets=True)))
 
@@ -179,6 +180,7 @@ def platt_logits(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
 def gcq(scores, tau, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
     penalties_cumsum = np.cumsum(penalties, axis=1)
     sizes_base = ((cumsum + penalties_cumsum) <= tau).sum(axis=1) + 1  # 1 - 1001
+    import pdb; pdb.set_trace()
     sizes_base = np.minimum(sizes_base, scores.shape[1]) # 1-1000
 
     if randomized:
