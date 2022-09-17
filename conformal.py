@@ -21,7 +21,7 @@ class ConformalModel(nn.Module):
         self.model = model_helper.model
         self.alpha = alpha
         self.T = torch.Tensor([1.3]) #initialize (1.3 is usually a good value)
-        # TODO: It is more structured to give self to platt method
+        # TODO: It is more structured to give self to platt method or just the used variables
         self.T, calib_logits = platt(self.model_helper)
         self.randomized=randomized
         self.allow_zero_sets=allow_zero_sets
@@ -51,7 +51,7 @@ class ConformalModel(nn.Module):
             scores = softmax(logits_numpy/self.T.item())#, axis=1)
             I, ordered, cumsum = sort_sum(scores)
 
-            S = gcq(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
+            S = gcq_fasttext(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
 
         return logits, S
 
@@ -74,6 +74,11 @@ def conformal_calibration(cmodel, calib_loader):
 
 # Temperature scaling
 def platt(helper, max_iters=10, lr=0.01, epsilon=0.01):
+    '''
+    Find T value (temperature) to rescale logits scores before applying the softmax
+    When T = 1, we recover the original probabilities with the default softmax
+    The method to get an optimal temperature T for a trained model is through minimizing the negative log likelihood for a held-out validation dataset.
+    '''
     print("Begin Platt scaling.")
     # Save logits so don't need to double compute them
     logits_dataset = get_logits_targets(helper)
@@ -139,6 +144,9 @@ class ConformalModelLogits(nn.Module):
         return logits, S
 
 def conformal_calibration_logits(cmodel, calib_loader):
+    '''
+    RAPS Conformal calibration
+    '''
     with torch.no_grad():
         E = np.array([])
         for logits, targets in calib_loader:
@@ -177,6 +185,41 @@ def platt_logits(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
 ### CORE CONFORMAL INFERENCE FUNCTIONS
 
 # Generalized conditional quantile function.
+def gcq_fasttext(scores, tau, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
+    '''
+    RAPS Prediction set generation.
+    
+    '''
+    # TODO: The shape here is tailored for fasttext example, 1-D scores
+    penalties_cumsum = np.cumsum(penalties)
+    sizes_base = ((cumsum + penalties_cumsum) <= tau).sum() + 1  # 1 - 1001
+    sizes_base = np.minimum(sizes_base, scores.shape[0]) # 1-1000
+
+    if randomized:
+        V = np.zeros(sizes_base)
+        for i in range(sizes_base):
+            V[i] = 1/ordered[i] * (tau-(cumsum[i]-ordered[i])-penalties_cumsum[i]) # -1 since sizes_base \in {1,...,1000}.
+        # TODO: Weird: V is between 1-100 (see 1/...) but np.random.random() generates between 0-1.   
+        sizes = sizes_base - (np.random.random(V.shape) >= V).astype(int)
+    else:
+        sizes = sizes_base
+    if tau == 1.0:
+        sizes[:] = cumsum.shape[0] # always predict max size if alpha==0. (Avoids numerical error.)
+
+    if not allow_zero_sets:
+        sizes[sizes == 0] = 1 # allow the user the option to never have empty sets (will lead to incorrect coverage if 1-alpha < model's top-1 accuracy
+
+    S = list()
+    # Construct S from equation (5)
+    # for i in range(I.shape[0]):
+    #     S = S + [I[i,0:sizes[i]],]
+    # TODO: The purpose of this entire size calculation is not clear to me. In fasttext case,
+    # it will always return I again.
+    for i in range(sizes.shape[0]):
+         S = S + [I[i]]
+
+    return S
+
 def gcq(scores, tau, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
     penalties_cumsum = np.cumsum(penalties, axis=1)
     sizes_base = ((cumsum + penalties_cumsum) <= tau).sum(axis=1) + 1  # 1 - 1001
