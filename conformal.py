@@ -27,6 +27,7 @@ class ConformalModel(nn.Module):
         self.allow_zero_sets=allow_zero_sets
         self.num_classes = model_helper.num_classes
         self.batch_size = model_helper.batch_size
+        self.labels = model_helper.get_labels()
         if kreg == None or lamda == None:
             kreg, lamda, calib_logits = pick_parameters(self.model, calib_logits, alpha, kreg, lamda, randomized, allow_zero_sets, pct_paramtune, self.batch_size, lamda_criterion)
 
@@ -52,8 +53,23 @@ class ConformalModel(nn.Module):
             I, ordered, cumsum = sort_sum(scores)
 
             S = gcq_fasttext(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
-
         return logits, S
+
+    def prediction_set(self, input):
+        '''
+        Generates the prediction set without GCQ optimization for now
+        # TODO: Add gcq optimization to output an optimized prediction set
+        '''
+        logits = self.model_helper.get_logits(input)
+        logits = torch.from_numpy(np.array(logits))
+        with torch.no_grad():
+            logits_numpy = logits.detach().cpu().numpy()
+            scores = softmax(logits_numpy / self.T.item())  # , axis=1)
+            # TODO: Replace all above with forward method after gcq is fixed!
+            prediction_set = [
+                {self.labels[idx]: x} for idx, x in enumerate(scores) if x >= (1 - self.Qhat)
+            ]
+        return prediction_set
 
 # Computes the conformal calibration
 def conformal_calibration(cmodel, calib_loader):
