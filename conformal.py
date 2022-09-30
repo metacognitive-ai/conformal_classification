@@ -7,49 +7,69 @@ import torch.utils.data as tdata
 import pandas as pd
 import time
 from tqdm import tqdm
-from utils import validate, get_logits_targets, sort_sum
+from utils import validate, get_logits_targets, sort_sum, sort_sum_dataloader
 import pdb
+
 
 # Conformalize a model with a calibration set.
 # Save it to a file in .cache/modelname
 # The only difference is that the forward method of ConformalModel also outputs a set.
 class ConformalModel(nn.Module):
-    def __init__(self, model, calib_loader, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, pct_paramtune = 0.3, batch_size=32, lamda_criterion='size'):
+    def __init__(self, model_helper, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, pct_paramtune = 0.3, lamda_criterion='size'):
         super(ConformalModel, self).__init__()
-        self.model = model 
+        self.model_helper = model_helper
+        self.model = model_helper.model
         self.alpha = alpha
         self.T = torch.Tensor([1.3]) #initialize (1.3 is usually a good value)
-        self.T, calib_logits = platt(self, calib_loader)
+        # TODO: It is more structured to give self to platt method or just the used variables
+        self.T, calib_logits = platt(self.model_helper)
         self.randomized=randomized
         self.allow_zero_sets=allow_zero_sets
-        self.num_classes = len(calib_loader.dataset.dataset.classes)
-
+        self.num_classes = model_helper.num_classes
+        self.batch_size = model_helper.batch_size
+        self.labels = model_helper.get_labels()
         if kreg == None or lamda == None:
-            kreg, lamda, calib_logits = pick_parameters(model, calib_logits, alpha, kreg, lamda, randomized, allow_zero_sets, pct_paramtune, batch_size, lamda_criterion)
+            kreg, lamda, calib_logits = pick_parameters(self.model, calib_logits, alpha, kreg, lamda, randomized, allow_zero_sets, pct_paramtune, self.batch_size, lamda_criterion)
 
         self.penalties = np.zeros((1, self.num_classes))
-        self.penalties[:, kreg:] += lamda 
+        self.penalties[:, kreg:] += lamda
 
-        calib_loader = tdata.DataLoader(calib_logits, batch_size = batch_size, shuffle=False, pin_memory=True)
+        calib_loader = tdata.DataLoader(calib_logits, batch_size=self.batch_size, shuffle=False, pin_memory=True)
 
         self.Qhat = conformal_calibration_logits(self, calib_loader)
+        print(f"Qhat value: {self.Qhat}")
 
     def forward(self, *args, randomized=None, allow_zero_sets=None, **kwargs):
         if randomized == None:
             randomized = self.randomized
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
-        logits = self.model(*args, **kwargs)
-        
+        logits = self.model_helper.get_logits(*args, **kwargs)
+        logits = torch.from_numpy(np.array(logits))
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
-            scores = softmax(logits_numpy/self.T.item(), axis=1)
-
+            #TODO: is this axis=1 relates to image or logits? We should make parametric
+            scores = softmax(logits_numpy/self.T.item())#, axis=1)
             I, ordered, cumsum = sort_sum(scores)
 
-            S = gcq(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
-
+            S = gcq_fasttext(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
         return logits, S
+
+    def prediction_set(self, input):
+        '''
+        Generates the prediction set without GCQ optimization for now
+        # TODO: Add gcq optimization to output an optimized prediction set
+        '''
+        logits = self.model_helper.get_logits(input)
+        logits = torch.from_numpy(np.array(logits))
+        with torch.no_grad():
+            logits_numpy = logits.detach().cpu().numpy()
+            scores = softmax(logits_numpy / self.T.item())  # , axis=1)
+            # TODO: Replace all above with forward method after gcq is fixed!
+            prediction_set = [
+                {self.labels[idx]: x} for idx, x in enumerate(scores) if x >= (1 - self.Qhat)
+            ]
+        return prediction_set
 
 # Computes the conformal calibration
 def conformal_calibration(cmodel, calib_loader):
@@ -63,22 +83,27 @@ def conformal_calibration(cmodel, calib_loader):
             I, ordered, cumsum = sort_sum(scores)
 
             E = np.concatenate((E,giq(scores,targets,I=I,ordered=ordered,cumsum=cumsum,penalties=cmodel.penalties,randomized=True, allow_zero_sets=True)))
-            
+
         Qhat = np.quantile(E,1-cmodel.alpha,interpolation='higher')
 
-        return Qhat 
+        return Qhat
 
 # Temperature scaling
-def platt(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
+def platt(helper, max_iters=10, lr=0.01, epsilon=0.01):
+    '''
+    Find T value (temperature) to rescale logits scores before applying the softmax
+    When T = 1, we recover the original probabilities with the default softmax
+    The method to get an optimal temperature T for a trained model is through minimizing the negative log likelihood for a held-out validation dataset.
+    '''
     print("Begin Platt scaling.")
     # Save logits so don't need to double compute them
-    logits_dataset = get_logits_targets(cmodel.model, calib_loader)
-    logits_loader = torch.utils.data.DataLoader(logits_dataset, batch_size = calib_loader.batch_size, shuffle=False, pin_memory=True)
+    logits_dataset = get_logits_targets(helper)
+    logits_loader = torch.utils.data.DataLoader(logits_dataset, batch_size=helper.batch_size, shuffle=False, pin_memory=True)
 
-    T = platt_logits(cmodel, logits_loader, max_iters=max_iters, lr=lr, epsilon=epsilon)
+    T = platt_logits(helper, logits_loader, max_iters=max_iters, lr=lr, epsilon=epsilon)
 
     print(f"Optimal T={T.item()}")
-    return T, logits_dataset 
+    return T, logits_dataset
 
 """
 
@@ -93,7 +118,7 @@ def platt(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
 class ConformalModelLogits(nn.Module):
     def __init__(self, model, calib_loader, alpha, kreg=None, lamda=None, randomized=True, allow_zero_sets=False, naive=False, LAC=False, pct_paramtune = 0.3, batch_size=32, lamda_criterion='size'):
         super(ConformalModelLogits, self).__init__()
-        self.model = model 
+        self.model = model
         self.alpha = alpha
         self.randomized = randomized
         self.LAC = LAC
@@ -112,7 +137,7 @@ class ConformalModelLogits(nn.Module):
             self.Qhat = conformal_calibration_logits(self, calib_loader)
         elif not naive and LAC:
             gt_locs_cal = np.array([np.where(np.argsort(x[0]).flip(dims=(0,)) == x[1])[0][0] for x in calib_loader.dataset])
-            scores_cal = 1-np.array([np.sort(torch.softmax(calib_loader.dataset[i][0]/self.T.item(), dim=0))[::-1][gt_locs_cal[i]] for i in range(len(calib_loader.dataset))]) 
+            scores_cal = 1-np.array([np.sort(torch.softmax(calib_loader.dataset[i][0]/self.T.item(), dim=0))[::-1][gt_locs_cal[i]] for i in range(len(calib_loader.dataset))])
             self.Qhat = np.quantile( scores_cal , np.ceil((scores_cal.shape[0]+1) * (1-alpha)) / scores_cal.shape[0] )
 
     def forward(self, logits, randomized=None, allow_zero_sets=None):
@@ -120,7 +145,7 @@ class ConformalModelLogits(nn.Module):
             randomized = self.randomized
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
-        
+
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
             scores = softmax(logits_numpy/self.T.item(), axis=1)
@@ -135,6 +160,9 @@ class ConformalModelLogits(nn.Module):
         return logits, S
 
 def conformal_calibration_logits(cmodel, calib_loader):
+    '''
+    RAPS Conformal calibration
+    '''
     with torch.no_grad():
         E = np.array([])
         for logits, targets in calib_loader:
@@ -142,40 +170,76 @@ def conformal_calibration_logits(cmodel, calib_loader):
 
             scores = softmax(logits/cmodel.T.item(), axis=1)
 
-            I, ordered, cumsum = sort_sum(scores)
+            I, ordered, cumsum = sort_sum_dataloader(scores)
 
             E = np.concatenate((E,giq(scores,targets,I=I,ordered=ordered,cumsum=cumsum,penalties=cmodel.penalties,randomized=True,allow_zero_sets=True)))
-            
+
         Qhat = np.quantile(E,1-cmodel.alpha,interpolation='higher')
 
-        return Qhat 
+        return Qhat
 
 def platt_logits(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
     nll_criterion = nn.CrossEntropyLoss().cuda()
 
-    T = nn.Parameter(torch.Tensor([1.3]).cuda())
+    T = nn.Parameter(torch.Tensor([1.3]).cpu())
 
     optimizer = optim.SGD([T], lr=lr)
     for iter in range(max_iters):
         T_old = T.item()
         for x, targets in calib_loader:
             optimizer.zero_grad()
-            x = x.cuda()
+            x = x.cpu()
             x.requires_grad = True
             out = x/T
-            loss = nll_criterion(out, targets.long().cuda())
+            loss = nll_criterion(out, targets.long().cpu())
             loss.backward()
             optimizer.step()
         if abs(T_old - T.item()) < epsilon:
             break
-    return T 
+    return T
 
 ### CORE CONFORMAL INFERENCE FUNCTIONS
 
 # Generalized conditional quantile function.
+def gcq_fasttext(scores, tau, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
+    '''
+    RAPS Prediction set generation.
+    
+    '''
+    # TODO: The shape here is tailored for fasttext example, 1-D scores
+    penalties_cumsum = np.cumsum(penalties)
+    sizes_base = ((cumsum + penalties_cumsum) <= tau).sum() + 1  # 1 - 1001
+    sizes_base = np.minimum(sizes_base, scores.shape[0]) # 1-1000
+
+    if randomized:
+        V = np.zeros(sizes_base)
+        for i in range(sizes_base):
+            V[i] = 1/ordered[i] * (tau-(cumsum[i]-ordered[i])-penalties_cumsum[i]) # -1 since sizes_base \in {1,...,1000}.
+        # TODO: Weird: V is between 1-100 (see 1/...) but np.random.random() generates between 0-1.   
+        sizes = sizes_base - (np.random.random(V.shape) >= V).astype(int)
+    else:
+        sizes = sizes_base
+    if tau == 1.0:
+        sizes[:] = cumsum.shape[0] # always predict max size if alpha==0. (Avoids numerical error.)
+
+    if not allow_zero_sets:
+        sizes[sizes == 0] = 1 # allow the user the option to never have empty sets (will lead to incorrect coverage if 1-alpha < model's top-1 accuracy
+
+    S = list()
+    # Construct S from equation (5)
+    # for i in range(I.shape[0]):
+    #     S = S + [I[i,0:sizes[i]],]
+    # TODO: The purpose of this entire size calculation is not clear to me. In fasttext case,
+    # it will always return I again.
+    for i in range(sizes.shape[0]):
+         S = S + [I[i]]
+
+    return S
+
 def gcq(scores, tau, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
     penalties_cumsum = np.cumsum(penalties, axis=1)
     sizes_base = ((cumsum + penalties_cumsum) <= tau).sum(axis=1) + 1  # 1 - 1001
+    import pdb; pdb.set_trace()
     sizes_base = np.minimum(sizes_base, scores.shape[1]) # 1-1000
 
     if randomized:
@@ -209,18 +273,18 @@ def get_tau(score, target, I, ordered, cumsum, penalty, randomized, allow_zero_s
 
     if not randomized:
         return tau_nonrandom + penalty[0]
-    
+
     U = np.random.random()
 
     if idx == (0,0):
         if not allow_zero_sets:
             return tau_nonrandom + penalty[0]
         else:
-            return U * tau_nonrandom + penalty[0] 
+            return U * tau_nonrandom + penalty[0]
     else:
         return U * ordered[idx] + cumsum[(idx[0],idx[1]-1)] + (penalty[0:(idx[1][0]+1)]).sum()
 
-# Gets the histogram of Taus. 
+# Gets the histogram of Taus.
 def giq(scores, targets, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
     """
         Generalized inverse quantile conformity score function.
@@ -236,11 +300,11 @@ def giq(scores, targets, I, ordered, cumsum, penalties, randomized, allow_zero_s
 def pick_kreg(paramtune_logits, alpha):
     gt_locs_kstar = np.array([np.where(np.argsort(x[0]).flip(dims=(0,)) == x[1])[0][0] for x in paramtune_logits])
     kstar = np.quantile(gt_locs_kstar, 1-alpha, interpolation='higher') + 1
-    return kstar 
+    return kstar
 
 def pick_lamda_size(model, paramtune_loader, alpha, kreg, randomized, allow_zero_sets):
     # Calculate lamda_star
-    best_size = iter(paramtune_loader).__next__()[0][1].shape[0] # number of classes 
+    best_size = iter(paramtune_loader).__next__()[0][1].shape[0] # number of classes
     # Use the paramtune data to pick lamda.  Does not violate exchangeability.
     for temp_lam in [0.001, 0.01, 0.1, 0.2, 0.5]: # predefined grid, change if more precision desired.
         conformal_model = ConformalModelLogits(model, paramtune_loader, alpha=alpha, kreg=kreg, lamda=temp_lam, randomized=randomized, allow_zero_sets=allow_zero_sets, naive=False)
@@ -259,7 +323,7 @@ def pick_lamda_adaptiveness(model, paramtune_loader, alpha, kreg, randomized, al
         conformal_model = ConformalModelLogits(model, paramtune_loader, alpha=alpha, kreg=kreg, lamda=temp_lam, randomized=randomized, allow_zero_sets=allow_zero_sets, naive=False)
         curr_violation = get_violation(conformal_model, paramtune_loader, strata, alpha)
         if curr_violation < best_violation:
-            best_violation = curr_violation 
+            best_violation = curr_violation
             lamda_star = temp_lam
     return lamda_star
 
@@ -285,7 +349,7 @@ def get_violation(cmodel, loader_paramtune, strata, alpha):
         output, S = cmodel(logit) # This is a 'dummy model' which takes logits, for efficiency.
         # measure accuracy and record loss
         size = np.array([x.size for x in S])
-        I, _, _ = sort_sum(logit.numpy()) 
+        I, _, _ = sort_sum(logit.numpy())
         correct = np.zeros_like(size)
         for j in range(correct.shape[0]):
             correct[j] = int( target[j] in list(S[j]) )
@@ -299,4 +363,3 @@ def get_violation(cmodel, loader_paramtune, strata, alpha):
         stratum_violation = abs(temp_df.correct.mean()-(1-alpha))
         wc_violation = max(wc_violation, stratum_violation)
     return wc_violation # the violation
-

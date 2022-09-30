@@ -11,10 +11,26 @@ import pickle
 from tqdm import tqdm
 import pdb
 
+
+# def sort_sum(scores):
+#     # Dataloader sort sum from the original code
+#     I = np.argsort(scores,axis=1)[:,::-1]
+#     ordered = np.sort(scores,axis=1)[:,::-1]
+#     cumsum = np.cumsum(ordered,axis=1)
+#     return I, ordered, cumsum
+
 def sort_sum(scores):
-    I = scores.argsort(axis=1)[:,::-1]
+    # TODO: old code had axis=1 but the output of fasttext is 1-D only
+    I = np.argsort(scores)
+    ordered = np.sort(scores)
+    cumsum = np.cumsum(ordered) 
+    return I, ordered, cumsum
+
+def sort_sum_dataloader(scores):
+    # Dataloader sort sum from the original code
+    I = np.argsort(scores,axis=1)[:,::-1]
     ordered = np.sort(scores,axis=1)[:,::-1]
-    cumsum = np.cumsum(ordered,axis=1) 
+    cumsum = np.cumsum(ordered,axis=1)
     return I, ordered, cumsum
 
 class AverageMeter(object):
@@ -40,6 +56,48 @@ class AverageMeter(object):
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
+
+def validate_fasttext(helper, print_bool):
+    batch_time = AverageMeter('batch_time')
+    top1 = AverageMeter('top1')
+    top5 = AverageMeter('top5')
+    coverage = AverageMeter('RAPS coverage')
+    size = AverageMeter('RAPS size')
+    # switch to evaluate mode
+    helper.cpmodel.eval()
+    end = time.time()
+    N = 0
+
+    lbls = helper.datasets['test']['label'].values
+    data = helper.datasets['test']['data'].values
+    # for i, (x, target) in enumerate(val_loader):
+    i = 0
+    while i + helper.batch_size <= len(lbls):
+        target = torch.from_numpy(np.array(lbls[i:(i+helper.batch_size)]))
+        # compute output
+        # This is conformal model, and it calls its own forward function
+        output, S = helper.cpmodel(data[i:(i+helper.batch_size)])
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy_fasttext(output, target, topk=(1, 5))
+        cvg, sz = coverage_size_fasttext(S, target)
+
+        # Update meters
+        top1.update(prec1.item()/100.0, n=helper.batch_size)
+        top5.update(prec5.item()/100.0, n=helper.batch_size)
+        coverage.update(cvg, n=helper.batch_size)
+        size.update(sz, n=helper.batch_size)
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        N = N + helper.batch_size
+        if print_bool:
+            print(f'\rN: {N} | Time: {batch_time.val:.3f} ({batch_time.avg:.3f}) | Cvg@1: {top1.val:.3f} ({top1.avg:.3f}) | Cvg@5: {top5.val:.3f} ({top5.avg:.3f}) | Cvg@RAPS: {coverage.val:.3f} ({coverage.avg:.3f}) | Size@RAPS: {size.val:.3f} ({size.avg:.3f})', end='')
+        i = i + helper.batch_size
+    if print_bool:
+        print('') #Endline
+
+    return top1.avg, top5.avg, coverage.avg, size.avg
 
 def validate(val_loader, model, print_bool):
     with torch.no_grad():
@@ -86,6 +144,16 @@ def coverage_size(S,targets):
         size = size + S[i].shape[0]
     return float(covered)/targets.shape[0], size/targets.shape[0]
 
+def coverage_size_fasttext(S,targets):
+    covered = 0
+    size = 0
+    # TODO: assuming that S is 1-D. Adjust for multi D examples, e.g., resnet
+    for i in range(targets.shape[0]):
+        if (targets[i] in S):
+            covered += 1
+        size = size + len(S)  # TODO: previously S.shape[0], but S is a list object?
+    return float(covered)/targets.shape[0], size/targets.shape[0]
+
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
     maxk = max(topk)
@@ -94,6 +162,21 @@ def accuracy(output, target, topk=(1,)):
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].float().sum()
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+def accuracy_fasttext(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+    
+    _, pred = output.topk(maxk)  # topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1).expand_as(pred))
 
     res = []
     for k in topk:
@@ -154,20 +237,33 @@ def get_model(modelname):
     return model
 
 # Computes logits and targets from a model and loader
-def get_logits_targets(model, loader):
-    logits = torch.zeros((len(loader.dataset), 1000)) # 1000 classes in Imagenet.
-    labels = torch.zeros((len(loader.dataset),))
+def get_logits_targets(helper):
+    logits = torch.zeros((len(helper.datasets['train']['data']), helper.num_classes))
+    labels = torch.zeros((len(helper.datasets['train']['data'])))
     i = 0
     print(f'Computing logits for model (only happens once).')
-    with torch.no_grad():
-        for x, targets in tqdm(loader):
-            batch_logits = model(x.cuda()).detach().cpu()
-            logits[i:(i+x.shape[0]), :] = batch_logits
-            labels[i:(i+x.shape[0])] = targets.cpu()
-            i = i + x.shape[0]
-    
+
+    # NOTE: We need to add .values at the end of two lines below for fasttext use (dataframes)
+    lbls = helper.datasets['train']['label'].values
+    data = helper.datasets['train']['data'].values
+    # Iterate according to the batch size
+    i = 0
+    while i + helper.batch_size <= len(lbls):
+        lgts = helper.get_logits(data[i:(i+helper.batch_size)])
+        logits[i:(i+helper.batch_size), :] = torch.from_numpy(np.array(lgts))
+        labels[i:(i+helper.batch_size)] = torch.from_numpy(np.array(lbls[i:(i+helper.batch_size)]))
+        i = i + helper.batch_size
+
+    """
+    for x, targets in tqdm(loader):
+        batch_logits = model(x.cuda()).detach().cpu()
+        logits[i:(i+x.shape[0]), :] = batch_logits
+        labels[i:(i+x.shape[0])] = targets.cpu()
+        i = i + x.shape[0]
+    """
+
     # Construct the dataset
-    dataset_logits = torch.utils.data.TensorDataset(logits, labels.long()) 
+    dataset_logits = torch.utils.data.TensorDataset(logits, labels.long())
     return dataset_logits
 
 def get_logits_dataset(modelname, datasetname, datasetpath, cache=str(pathlib.Path(__file__).parent.absolute()) + '/experiments/.cache/'):
