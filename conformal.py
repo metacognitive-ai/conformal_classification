@@ -66,10 +66,11 @@ class ConformalModel(nn.Module):
             logits_numpy = logits.detach().cpu().numpy()
             scores = softmax(logits_numpy / self.T.item())  # , axis=1)
             # TODO: Replace all above with forward method after gcq is fixed!
-            prediction_set = [
-                {self.labels[idx]: x} for idx, x in enumerate(scores) if x >= (1 - self.Qhat)
-            ]
-        return prediction_set
+            pred_set = {
+                self.labels[idx]: x for idx, x in enumerate(scores) if x >= (1 - self.Qhat)
+            }
+            pred_set = dict(sorted(pred_set.items(), key=lambda x: x[1], reverse=True))
+        return pred_set
 
 # Computes the conformal calibration
 def conformal_calibration(cmodel, calib_loader):
