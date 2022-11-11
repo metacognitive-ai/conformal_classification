@@ -44,15 +44,17 @@ class ConformalModel(nn.Module):
             randomized = self.randomized
         if allow_zero_sets == None:
             allow_zero_sets = self.allow_zero_sets
+
         logits = self.model_helper.get_logits(*args, **kwargs)
         logits = torch.from_numpy(np.array(logits))
+
         with torch.no_grad():
             logits_numpy = logits.detach().cpu().numpy()
             #TODO: is this axis=1 relates to image or logits? We should make parametric
-            scores = softmax(logits_numpy/self.T.item())#, axis=1)
-            I, ordered, cumsum = sort_sum(scores)
+            scores = softmax(logits_numpy/self.T.item(), axis=1)
+            I, ordered, cumsum = sort_sum_dataloader(scores)
 
-            S = gcq_fasttext(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
+            S = gcq(scores, self.Qhat, I=I, ordered=ordered, cumsum=cumsum, penalties=self.penalties, randomized=randomized, allow_zero_sets=allow_zero_sets)
         return logits, S
 
     def prediction_set(self, input):
@@ -67,7 +69,7 @@ class ConformalModel(nn.Module):
             scores = softmax(logits_numpy / self.T.item())  # , axis=1)
             # TODO: Replace all above with forward method after gcq is fixed!
             pred_set = {
-                self.labels[idx]: x for idx, x in enumerate(scores) if x >= (1 - self.Qhat)
+                self.labels[idx]: x for idx, x in enumerate(scores[0]) if x >= (1 - self.Qhat)
             }
             pred_set = dict(sorted(pred_set.items(), key=lambda x: x[1], reverse=True))
         return pred_set
@@ -78,7 +80,7 @@ def conformal_calibration(cmodel, calib_loader):
     with torch.no_grad():
         E = np.array([])
         for x, targets in tqdm(calib_loader):
-            logits = cmodel.model(x.cuda()).detach().cpu().numpy()
+            logits = cmodel.model(x.cpu()).detach().cpu().numpy()
             scores = softmax(logits/cmodel.T.item(), axis=1)
 
             I, ordered, cumsum = sort_sum(scores)
@@ -180,7 +182,7 @@ def conformal_calibration_logits(cmodel, calib_loader):
         return Qhat
 
 def platt_logits(cmodel, calib_loader, max_iters=10, lr=0.01, epsilon=0.01):
-    nll_criterion = nn.CrossEntropyLoss().cuda()
+    nll_criterion = nn.CrossEntropyLoss().cpu()
 
     T = nn.Parameter(torch.Tensor([1.3]).cpu())
 
@@ -240,7 +242,7 @@ def gcq_fasttext(scores, tau, I, ordered, cumsum, penalties, randomized, allow_z
 def gcq(scores, tau, I, ordered, cumsum, penalties, randomized, allow_zero_sets):
     penalties_cumsum = np.cumsum(penalties, axis=1)
     sizes_base = ((cumsum + penalties_cumsum) <= tau).sum(axis=1) + 1  # 1 - 1001
-    import pdb; pdb.set_trace()
+
     sizes_base = np.minimum(sizes_base, scores.shape[1]) # 1-1000
 
     if randomized:
