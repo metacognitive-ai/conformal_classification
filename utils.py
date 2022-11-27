@@ -68,8 +68,8 @@ def validate_fasttext(helper, print_bool):
     end = time.time()
     N = 0
 
-    lbls = helper.datasets['test']['label'].values
-    data = helper.datasets['test']['data'].values
+    lbls = helper.datasets['test']['label']
+    data = helper.datasets['test']['data']
     # for i, (x, target) in enumerate(val_loader):
     i = 0
     while i + helper.batch_size <= len(lbls):
@@ -160,7 +160,8 @@ def accuracy(output, target, topk=(1,)):
     batch_size = target.size(0)
 
     _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
+    pred = pred.t().cuda()
+    target = target.cuda()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
 
     res = []
@@ -243,9 +244,10 @@ def get_logits_targets(helper):
     i = 0
     print(f'Computing logits for model (only happens once).')
 
-    # NOTE: We need to add .values at the end of two lines below for fasttext use (dataframes)
-    lbls = helper.datasets['train']['label'].values
-    data = helper.datasets['train']['data'].values
+    lbls = helper.datasets['train']['label']
+    data = helper.datasets['train']['data']
+
+    
     # Iterate according to the batch size
     i = 0
     while i + helper.batch_size <= len(lbls):
@@ -254,46 +256,7 @@ def get_logits_targets(helper):
         labels[i:(i+helper.batch_size)] = torch.from_numpy(np.array(lbls[i:(i+helper.batch_size)]))
         i = i + helper.batch_size
 
-    """
-    for x, targets in tqdm(loader):
-        batch_logits = model(x.cuda()).detach().cpu()
-        logits[i:(i+x.shape[0]), :] = batch_logits
-        labels[i:(i+x.shape[0])] = targets.cpu()
-        i = i + x.shape[0]
-    """
-
     # Construct the dataset
     dataset_logits = torch.utils.data.TensorDataset(logits, labels.long())
     return dataset_logits
 
-def get_logits_dataset(modelname, datasetname, datasetpath, cache=str(pathlib.Path(__file__).parent.absolute()) + '/experiments/.cache/'):
-    fname = cache + datasetname + '/' + modelname + '.pkl' 
-
-    # If the file exists, load and return it.
-    if os.path.exists(fname):
-        with open(fname, 'rb') as handle:
-            return pickle.load(handle)
-
-    # Else we will load our model, run it on the dataset, and save/return the output.
-    model = get_model(modelname)
-
-    transform = transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std =[0.229, 0.224, 0.225])
-                    ])
-    
-    dataset = torchvision.datasets.ImageFolder(datasetpath, transform)
-    loader = torch.utils.data.DataLoader(dataset, batch_size = 32, shuffle=False, pin_memory=True)
-
-    # Get the logits and targets
-    dataset_logits = get_logits_targets(model, loader)
-
-    # Save the dataset 
-    os.makedirs(os.path.dirname(fname), exist_ok=True)
-    with open(fname, 'wb') as handle:
-        pickle.dump(dataset_logits, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    return dataset_logits
